@@ -20,19 +20,37 @@ jobs:
       POSTGRES_PORT: 5434
       DATABASE_URL: postgresql+asyncpg://telemed_user:telemed_password@localhost:5434/telemed_db
       SYNC_DATABASE_URL: postgresql://telemed_user:telemed_password@localhost:5434/telemed_db
+      BASE_URL: http://localhost:8000
 
     steps:
+      # -------------------------------------------------------
+      # CHECKOUT
+      # -------------------------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # -------------------------------------------------------
+      # ENVIRONMENT
+      # -------------------------------------------------------
+
       - name: Verify runner environment
         run: |
-          echo "Runner: $(uname -m)"
-          echo "macOS: $(sw_vers -productVersion)"
+          echo "============================================="
+          echo "RUNNER ENVIRONMENT"
+          echo "============================================="
+          echo "Runner architecture: $(uname -m)"
+          echo "macOS version: $(sw_vers -productVersion)"
+          echo "Python:"
           python3 --version
+          echo "Node:"
           node --version
+          echo "npm:"
           npm --version
+          echo "Docker:"
           docker --version
+          echo "Docker Compose:"
+          docker compose version
 
       # -------------------------------------------------------
       # DATABASE
@@ -40,7 +58,12 @@ jobs:
 
       - name: Start PostgreSQL
         run: |
+          echo "Starting PostgreSQL..."
+
           docker compose up -d telemed-postgres
+
+          echo "PostgreSQL container status:"
+          docker ps --filter "name=telemed-postgres"
 
       - name: Wait for PostgreSQL
         run: |
@@ -50,40 +73,177 @@ jobs:
             if docker exec telemed-postgres pg_isready \
               -U "$POSTGRES_USER" \
               -d "$POSTGRES_DB" > /dev/null 2>&1; then
+
               echo "PostgreSQL is ready."
-              break
+              exit 0
             fi
 
             echo "PostgreSQL is not ready yet..."
             sleep 2
           done
 
-          docker exec telemed-postgres pg_isready \
-            -U "$POSTGRES_USER" \
-            -d "$POSTGRES_DB"
+          echo "PostgreSQL failed to become ready."
+          docker logs telemed-postgres
+          exit 1
 
       # -------------------------------------------------------
-      # BACKEND
+      # BACKEND SETUP
       # -------------------------------------------------------
 
       - name: Create backend virtual environment
         working-directory: backend
         run: |
+          echo "Creating backend virtual environment..."
+
           rm -rf venv
+
           python3 -m venv venv
+
           source venv/bin/activate
+
           python -m pip install --upgrade pip
+
           pip install -r requirements.txt
 
-      - name: Run backend tests with coverage
+      - name: Verify backend dependencies
         working-directory: backend
         run: |
           source venv/bin/activate
 
-          pytest -v -s \
-            --cov=app \
-            --cov-report=term-missing \
-            --cov-report=xml:coverage.xml
+          python --version
+          pytest --version
+          python -c "import fastapi; print('FastAPI:', fastapi.__version__)"
+          python -c "import sqlalchemy; print('SQLAlchemy:', sqlalchemy.__version__)"
+          python -c "import greenlet; print('greenlet:', greenlet.__version__)"
+          python -c "import coverage; print('coverage:', coverage.__version__)"
+
+      # -------------------------------------------------------
+      # DATABASE INITIALIZATION
+      # -------------------------------------------------------
+
+      - name: Initialize backend database
+        working-directory: backend
+        run: |
+          source venv/bin/activate
+
+          echo "Initializing database..."
+
+          python -m app.seed
+
+      # -------------------------------------------------------
+      # START FASTAPI
+      # -------------------------------------------------------
+
+      - name: Start FastAPI application
+        working-directory: backend
+        run: |
+          source venv/bin/activate
+
+          echo "Starting FastAPI application..."
+
+          rm -f coverage.data coverage.xml
+
+          coverage run \
+            --source=app \
+            --data-file=coverage.data \
+            -m uvicorn app.main:app \
+            --host 0.0.0.0 \
+            --port 8000 \
+            > ../fastapi.log 2>&1 &
+
+          echo $! > ../fastapi.pid
+
+          echo "FastAPI PID: $(cat ../fastapi.pid)"
+
+      - name: Wait for FastAPI
+        run: |
+          echo "Waiting for FastAPI..."
+
+          for i in {1..30}; do
+            if curl --fail --silent \
+              http://localhost:8000/health > /dev/null 2>&1; then
+
+              echo "FastAPI is ready."
+              exit 0
+            fi
+
+            echo "FastAPI is not ready yet..."
+            sleep 2
+          done
+
+          echo "FastAPI failed to start."
+
+          if [ -f fastapi.log ]; then
+            echo "============================================="
+            echo "FASTAPI LOG"
+            echo "============================================="
+            cat fastapi.log
+          fi
+
+          exit 1
+
+      # -------------------------------------------------------
+      # BACKEND TESTS
+      # -------------------------------------------------------
+
+      - name: Run backend end-to-end tests
+        working-directory: backend
+        run: |
+          source venv/bin/activate
+
+          echo "============================================="
+          echo "BACKEND END-TO-END TESTS"
+          echo "============================================="
+
+          pytest -v -s
+
+      - name: Generate backend coverage report
+        if: always()
+        working-directory: backend
+        run: |
+          source venv/bin/activate
+
+          echo "Generating backend coverage report..."
+
+          if [ -f coverage.data ]; then
+            coverage xml \
+              --data-file=coverage.data \
+              -o coverage.xml
+
+            coverage report \
+              --data-file=coverage.data
+          else
+            echo "Backend coverage data was not generated."
+          fi
+
+      # -------------------------------------------------------
+      # STOP FASTAPI
+      # -------------------------------------------------------
+
+      - name: Stop FastAPI application
+        if: always()
+        run: |
+          if [ -f fastapi.pid ]; then
+            FASTAPI_PID=$(cat fastapi.pid)
+
+            echo "Stopping FastAPI process: $FASTAPI_PID"
+
+            kill "$FASTAPI_PID" 2>/dev/null || true
+
+            sleep 2
+
+            kill -9 "$FASTAPI_PID" 2>/dev/null || true
+          fi
+
+      - name: Display FastAPI log
+        if: always()
+        run: |
+          if [ -f fastapi.log ]; then
+            echo "============================================="
+            echo "FASTAPI APPLICATION LOG"
+            echo "============================================="
+            cat fastapi.log
+          fi
 
       # -------------------------------------------------------
       # FRONTEND
@@ -97,16 +257,28 @@ jobs:
       - name: Run frontend lint
         working-directory: frontend
         run: |
+          echo "============================================="
+          echo "FRONTEND ESLINT"
+          echo "============================================="
+
           npm run lint
 
       - name: Run frontend tests with coverage
         working-directory: frontend
         run: |
+          echo "============================================="
+          echo "FRONTEND TESTS"
+          echo "============================================="
+
           npm run test:coverage
 
       - name: Build frontend
         working-directory: frontend
         run: |
+          echo "============================================="
+          echo "FRONTEND PRODUCTION BUILD"
+          echo "============================================="
+
           npm run build
 
       # -------------------------------------------------------
@@ -115,8 +287,13 @@ jobs:
 
       - name: Check SonarQube availability
         run: |
+          echo "Checking SonarQube..."
+
           curl --fail --silent \
             "${{ secrets.SONAR_HOST_URL }}/api/system/status"
+
+          echo
+          echo "SonarQube is available."
 
       - name: SonarQube analysis
         uses: SonarSource/sonarqube-scan-action@v6
@@ -136,6 +313,7 @@ jobs:
       # -------------------------------------------------------
 
       - name: Generate software metrics report
+        if: always()
         run: |
           mkdir -p quality-report
 
@@ -153,7 +331,7 @@ jobs:
           ---------------------------------------------
           Framework: FastAPI
           Test framework: pytest
-          End-to-end tests: 14
+          End-to-end test suite: Comprehensive E2E verification
           Coverage report: backend/coverage.xml
 
           FRONTEND QUALITY
@@ -162,19 +340,25 @@ jobs:
           Test framework: Vitest
           Linting: ESLint
           Coverage report: frontend/coverage/lcov.info
-          Production build: Successful
+          Production build: npm run build
 
           STATIC ANALYSIS
           ---------------------------------------------
           Tool: SonarQube
-          Analysis: Completed by CI pipeline
+          Analysis: Executed by GitHub Actions
           Quality Gate: Evaluated by SonarQube
 
           =============================================
           END OF REPORT
+          =============================================
           EOF
 
+      # -------------------------------------------------------
+      # UPLOAD REPORTS
+      # -------------------------------------------------------
+
       - name: Upload software quality reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: telemed-software-quality-reports
@@ -182,6 +366,8 @@ jobs:
             backend/coverage.xml
             frontend/coverage/
             quality-report/
+            fastapi.log
+          if-no-files-found: warn
 
       # -------------------------------------------------------
       # CLEANUP
@@ -190,4 +376,8 @@ jobs:
       - name: Stop PostgreSQL
         if: always()
         run: |
+          echo "Stopping PostgreSQL..."
+
           docker compose down
+
+          echo "PostgreSQL stopped."
