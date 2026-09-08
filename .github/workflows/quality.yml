@@ -282,16 +282,22 @@ jobs:
           import asyncio
 
           from sqlalchemy import text
-          from app.database import engine
+          from app.database import async_engine
 
           async def check_database():
-              async with engine.connect() as connection:
-                  result = await connection.execute(text("SELECT 1"))
-                  value = result.scalar()
+              try:
+                  async with async_engine.connect() as connection:
+                      result = await connection.execute(text("SELECT 1"))
+                      value = result.scalar()
 
-                  assert value == 1, "Database query did not return expected result"
+                      assert value == 1, (
+                          "Database query did not return expected result"
+                      )
 
-                  print("Application database connection is healthy.")
+                      print("Application database connection is healthy.")
+
+              finally:
+                  await async_engine.dispose()
 
           asyncio.run(check_database())
           PY
@@ -330,7 +336,18 @@ jobs:
 
             kill "$FASTAPI_PID" 2>/dev/null || true
 
-            sleep 3
+            for i in {1..10}; do
+              if ! kill -0 "$FASTAPI_PID" 2>/dev/null; then
+                echo "FastAPI stopped cleanly."
+                rm -f fastapi.pid
+                exit 0
+              fi
+
+              echo "Waiting for FastAPI to stop..."
+              sleep 1
+            done
+
+            echo "FastAPI did not stop gracefully. Force stopping..."
 
             kill -9 "$FASTAPI_PID" 2>/dev/null || true
 
