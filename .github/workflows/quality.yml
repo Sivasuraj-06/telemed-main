@@ -23,6 +23,7 @@ jobs:
       BASE_URL: http://localhost:8000
 
     steps:
+
       # -------------------------------------------------------
       # CHECKOUT
       # -------------------------------------------------------
@@ -39,16 +40,22 @@ jobs:
           echo "============================================="
           echo "RUNNER ENVIRONMENT"
           echo "============================================="
+
           echo "Runner architecture: $(uname -m)"
           echo "macOS version: $(sw_vers -productVersion)"
+
           echo "Python:"
           python3 --version
+
           echo "Node:"
           node --version
+
           echo "npm:"
           npm --version
+
           echo "Docker:"
           docker --version
+
           echo "Docker Compose:"
           docker compose version
 
@@ -58,7 +65,11 @@ jobs:
 
       - name: Start PostgreSQL
         run: |
-          echo "Starting PostgreSQL..."
+          echo "============================================="
+          echo "STARTING POSTGRESQL"
+          echo "============================================="
+
+          docker compose down --remove-orphans || true
 
           docker compose up -d telemed-postgres
 
@@ -67,7 +78,9 @@ jobs:
 
       - name: Wait for PostgreSQL
         run: |
-          echo "Waiting for PostgreSQL..."
+          echo "============================================="
+          echo "WAITING FOR POSTGRESQL"
+          echo "============================================="
 
           for i in {1..30}; do
             if docker exec telemed-postgres pg_isready \
@@ -83,7 +96,13 @@ jobs:
           done
 
           echo "PostgreSQL failed to become ready."
+
+          echo "============================================="
+          echo "POSTGRESQL LOG"
+          echo "============================================="
+
           docker logs telemed-postgres
+
           exit 1
 
       # -------------------------------------------------------
@@ -93,7 +112,9 @@ jobs:
       - name: Create backend virtual environment
         working-directory: backend
         run: |
-          echo "Creating backend virtual environment..."
+          echo "============================================="
+          echo "BACKEND ENVIRONMENT"
+          echo "============================================="
 
           rm -rf venv
 
@@ -110,10 +131,19 @@ jobs:
         run: |
           source venv/bin/activate
 
+          echo "============================================="
+          echo "BACKEND DEPENDENCIES"
+          echo "============================================="
+
+          echo "Python:"
           python --version
+
+          echo "Pytest:"
           pytest --version
+
           python -c "import fastapi; print('FastAPI:', fastapi.__version__)"
           python -c "import sqlalchemy; print('SQLAlchemy:', sqlalchemy.__version__)"
+          python -c "import asyncpg; print('asyncpg:', asyncpg.__version__)"
           python -c "import greenlet; print('greenlet:', greenlet.__version__)"
           python -c "import coverage; print('coverage:', coverage.__version__)"
 
@@ -124,11 +154,57 @@ jobs:
       - name: Initialize backend database
         working-directory: backend
         run: |
+          echo "============================================="
+          echo "INITIALIZING DATABASE"
+          echo "============================================="
+
           source venv/bin/activate
 
-          echo "Initializing database..."
-
           python -m app.seed
+
+      - name: Verify seeded admin account
+        working-directory: backend
+        run: |
+          echo "============================================="
+          echo "VERIFYING ADMIN ACCOUNT"
+          echo "============================================="
+
+          source venv/bin/activate
+
+          python - <<'PY'
+          import asyncio
+          import asyncpg
+
+          async def check():
+              conn = await asyncpg.connect(
+                  "postgresql://telemed_user:telemed_password@localhost:5434/telemed_db"
+              )
+
+              try:
+                  row = await conn.fetchrow(
+                      """
+                      SELECT id, username, email, role, is_active
+                      FROM users
+                      WHERE username = 'admin'
+                      """
+                  )
+
+                  print(
+                      "Admin database record:",
+                      dict(row) if row else None
+                  )
+
+                  assert row is not None, "Default admin was not created"
+                  assert row["username"] == "admin"
+                  assert row["is_active"] is True
+
+                  print("Admin account verification passed.")
+
+              finally:
+                  await conn.close()
+
+          asyncio.run(check())
+          PY
 
       # -------------------------------------------------------
       # START FASTAPI
@@ -137,27 +213,35 @@ jobs:
       - name: Start FastAPI application
         working-directory: backend
         run: |
+          echo "============================================="
+          echo "STARTING FASTAPI"
+          echo "============================================="
+
           source venv/bin/activate
 
-          echo "Starting FastAPI application..."
-
           rm -f coverage.data coverage.xml
+          rm -f ../fastapi.log ../fastapi.pid
 
-          coverage run \
+          PYTHONUNBUFFERED=1 coverage run \
             --source=app \
             --data-file=coverage.data \
             -m uvicorn app.main:app \
             --host 0.0.0.0 \
             --port 8000 \
+            --log-level debug \
             > ../fastapi.log 2>&1 &
 
-          echo $! > ../fastapi.pid
+          FASTAPI_PID=$!
 
-          echo "FastAPI PID: $(cat ../fastapi.pid)"
+          echo "$FASTAPI_PID" > ../fastapi.pid
+
+          echo "FastAPI PID: $FASTAPI_PID"
 
       - name: Wait for FastAPI
         run: |
-          echo "Waiting for FastAPI..."
+          echo "============================================="
+          echo "WAITING FOR FASTAPI"
+          echo "============================================="
 
           for i in {1..30}; do
             if curl --fail --silent \
@@ -173,48 +257,60 @@ jobs:
 
           echo "FastAPI failed to start."
 
-          if [ -f fastapi.log ]; then
-            echo "============================================="
-            echo "FASTAPI LOG"
-            echo "============================================="
-            cat fastapi.log
-          fi
+          echo "============================================="
+          echo "FASTAPI LOG"
+          echo "============================================="
+
+          cat fastapi.log || true
 
           exit 1
+
+      # -------------------------------------------------------
+      # APPLICATION DATABASE CONNECTIVITY
+      # -------------------------------------------------------
+
+      - name: Verify application database connectivity
+        working-directory: backend
+        run: |
+          echo "============================================="
+          echo "VERIFYING APPLICATION DATABASE CONNECTION"
+          echo "============================================="
+
+          source venv/bin/activate
+
+          python - <<'PY'
+          import asyncio
+
+          from sqlalchemy import text
+          from app.database import engine
+
+          async def check_database():
+              async with engine.connect() as connection:
+                  result = await connection.execute(text("SELECT 1"))
+                  value = result.scalar()
+
+                  assert value == 1, "Database query did not return expected result"
+
+                  print("Application database connection is healthy.")
+
+          asyncio.run(check_database())
+          PY
 
       # -------------------------------------------------------
       # BACKEND TESTS
       # -------------------------------------------------------
 
       - name: Run backend end-to-end tests
+        id: backend_tests
         working-directory: backend
         run: |
-          source venv/bin/activate
-
           echo "============================================="
           echo "BACKEND END-TO-END TESTS"
           echo "============================================="
 
-          pytest -v -s
-
-      - name: Generate backend coverage report
-        if: always()
-        working-directory: backend
-        run: |
           source venv/bin/activate
 
-          echo "Generating backend coverage report..."
-
-          if [ -f coverage.data ]; then
-            coverage xml \
-              --data-file=coverage.data \
-              -o coverage.xml
-
-            coverage report \
-              --data-file=coverage.data
-          else
-            echo "Backend coverage data was not generated."
-          fi
+          pytest -v -s
 
       # -------------------------------------------------------
       # STOP FASTAPI
@@ -223,6 +319,10 @@ jobs:
       - name: Stop FastAPI application
         if: always()
         run: |
+          echo "============================================="
+          echo "STOPPING FASTAPI"
+          echo "============================================="
+
           if [ -f fastapi.pid ]; then
             FASTAPI_PID=$(cat fastapi.pid)
 
@@ -230,19 +330,59 @@ jobs:
 
             kill "$FASTAPI_PID" 2>/dev/null || true
 
-            sleep 2
+            sleep 3
 
             kill -9 "$FASTAPI_PID" 2>/dev/null || true
+
+            rm -f fastapi.pid
+          else
+            echo "FastAPI PID file was not found."
           fi
+
+      # -------------------------------------------------------
+      # BACKEND COVERAGE
+      # -------------------------------------------------------
+
+      - name: Generate backend coverage report
+        if: always()
+        working-directory: backend
+        run: |
+          source venv/bin/activate
+
+          echo "============================================="
+          echo "BACKEND COVERAGE"
+          echo "============================================="
+
+          if [ -f coverage.data ]; then
+
+            coverage xml \
+              --data-file=coverage.data \
+              -o coverage.xml
+
+            coverage report \
+              --data-file=coverage.data
+
+            echo "Backend coverage XML generated successfully."
+
+          else
+            echo "Backend coverage data was not generated."
+          fi
+
+      # -------------------------------------------------------
+      # DISPLAY FASTAPI LOG
+      # -------------------------------------------------------
 
       - name: Display FastAPI log
         if: always()
         run: |
+          echo "============================================="
+          echo "FASTAPI APPLICATION LOG"
+          echo "============================================="
+
           if [ -f fastapi.log ]; then
-            echo "============================================="
-            echo "FASTAPI APPLICATION LOG"
-            echo "============================================="
             cat fastapi.log
+          else
+            echo "fastapi.log was not found."
           fi
 
       # -------------------------------------------------------
@@ -252,9 +392,14 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: |
+          echo "============================================="
+          echo "INSTALLING FRONTEND DEPENDENCIES"
+          echo "============================================="
+
           npm ci
 
       - name: Run frontend lint
+        id: frontend_lint
         working-directory: frontend
         run: |
           echo "============================================="
@@ -264,6 +409,7 @@ jobs:
           npm run lint
 
       - name: Run frontend tests with coverage
+        id: frontend_tests
         working-directory: frontend
         run: |
           echo "============================================="
@@ -273,6 +419,7 @@ jobs:
           npm run test:coverage
 
       - name: Build frontend
+        id: frontend_build
         working-directory: frontend
         run: |
           echo "============================================="
@@ -287,7 +434,14 @@ jobs:
 
       - name: Check SonarQube availability
         run: |
-          echo "Checking SonarQube..."
+          echo "============================================="
+          echo "SONARQUBE AVAILABILITY"
+          echo "============================================="
+
+          if [ -z "${{ secrets.SONAR_HOST_URL }}" ]; then
+            echo "SONAR_HOST_URL secret is not configured."
+            exit 1
+          fi
 
           curl --fail --silent \
             "${{ secrets.SONAR_HOST_URL }}/api/system/status"
@@ -317,7 +471,69 @@ jobs:
         run: |
           mkdir -p quality-report
 
-          cat > quality-report/metrics-summary.txt <<'EOF'
+          echo "============================================="
+          echo "GENERATING SOFTWARE QUALITY METRICS REPORT"
+          echo "============================================="
+
+          BACKEND_TEST_STATUS="FAILED"
+          if [ "${{ steps.backend_tests.outcome }}" = "success" ]; then
+            BACKEND_TEST_STATUS="PASSED"
+          fi
+
+          FRONTEND_LINT_STATUS="FAILED"
+          if [ "${{ steps.frontend_lint.outcome }}" = "success" ]; then
+            FRONTEND_LINT_STATUS="PASSED"
+          fi
+
+          FRONTEND_TEST_STATUS="FAILED"
+          if [ "${{ steps.frontend_tests.outcome }}" = "success" ]; then
+            FRONTEND_TEST_STATUS="PASSED"
+          fi
+
+          FRONTEND_BUILD_STATUS="FAILED"
+          if [ "${{ steps.frontend_build.outcome }}" = "success" ]; then
+            FRONTEND_BUILD_STATUS="PASSED"
+          fi
+
+          BACKEND_COVERAGE="Unavailable"
+
+          if [ -f backend/coverage.xml ]; then
+            BACKEND_COVERAGE=$(python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("backend/coverage.xml").getroot()
+
+          line_rate = root.attrib.get("line-rate")
+
+          if line_rate is not None:
+              print(f"{float(line_rate) * 100:.2f}%")
+          else:
+              print("Unavailable")
+          PY
+            )
+          fi
+
+          FRONTEND_COVERAGE="Unavailable"
+
+          if [ -f frontend/coverage/coverage-summary.json ]; then
+            FRONTEND_COVERAGE=$(python3 - <<'PY'
+          import json
+
+          with open("frontend/coverage/coverage-summary.json") as f:
+              data = json.load(f)
+
+          total = data.get("total", {})
+          lines = total.get("lines", {})
+
+          if "pct" in lines:
+              print(f"{lines['pct']}%")
+          else:
+              print("Unavailable")
+          PY
+            )
+          fi
+
+          cat > quality-report/metrics-summary.txt <<EOF
           TELEMED APPLICATION
           SOFTWARE QUALITY METRICS REPORT
           =============================================
@@ -332,6 +548,8 @@ jobs:
           Framework: FastAPI
           Test framework: pytest
           End-to-end test suite: Comprehensive E2E verification
+          Backend E2E result: ${BACKEND_TEST_STATUS}
+          Backend line coverage: ${BACKEND_COVERAGE}
           Coverage report: backend/coverage.xml
 
           FRONTEND QUALITY
@@ -339,8 +557,11 @@ jobs:
           Framework: React + Vite
           Test framework: Vitest
           Linting: ESLint
+          ESLint result: ${FRONTEND_LINT_STATUS}
+          Frontend test result: ${FRONTEND_TEST_STATUS}
+          Frontend line coverage: ${FRONTEND_COVERAGE}
+          Production build result: ${FRONTEND_BUILD_STATUS}
           Coverage report: frontend/coverage/lcov.info
-          Production build: npm run build
 
           STATIC ANALYSIS
           ---------------------------------------------
@@ -348,10 +569,23 @@ jobs:
           Analysis: Executed by GitHub Actions
           Quality Gate: Evaluated by SonarQube
 
+          REPORT INFORMATION
+          ---------------------------------------------
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref_name }}
+          Workflow: ${{ github.workflow }}
+          Run number: ${{ github.run_number }}
+
           =============================================
           END OF REPORT
           =============================================
           EOF
+
+          echo "============================================="
+          echo "SOFTWARE QUALITY METRICS REPORT"
+          echo "============================================="
+
+          cat quality-report/metrics-summary.txt
 
       # -------------------------------------------------------
       # UPLOAD REPORTS
@@ -376,8 +610,10 @@ jobs:
       - name: Stop PostgreSQL
         if: always()
         run: |
-          echo "Stopping PostgreSQL..."
+          echo "============================================="
+          echo "STOPPING POSTGRESQL"
+          echo "============================================="
 
-          docker compose down
+          docker compose down --remove-orphans
 
           echo "PostgreSQL stopped."
