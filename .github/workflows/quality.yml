@@ -1,0 +1,166 @@
+name: Telemed Software Quality Pipeline
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality-analysis:
+    name: Build, Test, Coverage and SonarQube
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: telemed_user
+          POSTGRES_PASSWORD: telemed_password
+          POSTGRES_DB: telemed_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U telemed_user -d telemed_db"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: Initialize test database
+        working-directory: backend
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_USER: telemed_user
+          POSTGRES_PASSWORD: telemed_password
+          POSTGRES_DB: telemed_db
+        run: python -m app.seed
+
+      - name: Start backend
+        working-directory: backend
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_USER: telemed_user
+          POSTGRES_PASSWORD: telemed_password
+          POSTGRES_DB: telemed_db
+          EMAIL_SERVICE_URL: http://localhost:5001
+        run: |
+          nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 > /tmp/telemed-backend.log 2>&1 &
+          for i in {1..30}; do
+            if curl --fail --silent http://localhost:8000/health > /dev/null; then
+              echo "Backend is ready"
+              break
+            fi
+            sleep 2
+          done
+          curl --fail http://localhost:8000/health
+
+      - name: Run backend tests with coverage
+        working-directory: backend
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_USER: telemed_user
+          POSTGRES_PASSWORD: telemed_password
+          POSTGRES_DB: telemed_db
+        run: pytest --cov=app --cov-report=term-missing --cov-report=xml
+
+      - name: Run ESLint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Run frontend tests with coverage
+        working-directory: frontend
+        run: npm run test:coverage
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: telemed-coverage
+          path: |
+            backend/coverage.xml
+            frontend/coverage/
+          if-no-files-found: warn
+
+      - name: SonarQube scan
+        if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      - name: SonarQube Quality Gate
+        if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+      - name: Generate software metrics report
+        if: always()
+        run: |
+          mkdir -p metrics-report
+          cat > metrics-report/software-metrics.md <<'EOF'
+          # Telemed Software Quality Metrics Report
+
+          ## Automated Checks
+
+          | Metric | Pipeline source |
+          |---|---|
+          | Backend tests | pytest |
+          | Backend coverage | pytest-cov / coverage.xml |
+          | Frontend lint | ESLint |
+          | Frontend build | Vite |
+          | Frontend tests | Vitest |
+          | Frontend coverage | Vitest / LCOV |
+          | Static analysis | SonarQube |
+          | Quality Gate | SonarQube |
+
+          Detailed SonarQube metrics are available in the SonarQube project dashboard after a successful analysis.
+          EOF
+
+      - name: Upload software metrics report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: software-metrics-report
+          path: metrics-report/software-metrics.md

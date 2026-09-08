@@ -1,0 +1,19 @@
+design-reference/
+.env
+PROGRESS.md
+SPEC.md
+
+# Python
+backend/venv/
+backend/.pytest_cache/
+backend/**/__pycache__/
+backend/coverage.xml
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+
+# SonarQube
+.scannerwork/
+
